@@ -122,7 +122,7 @@ app.post('/voice/menu', (req, res) => {
         `No problem at all — we are here to help! ` +
         `To get your repair scheduled as quickly as possible, ` +
         `we just need to collect a few quick details from you. ` +
-        `First, please say your full name after the tone.`
+        `First, please say your full name`
       )
     );
 
