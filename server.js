@@ -12,7 +12,7 @@ app.use(cors());
 const TWILIO_SID        = process.env.TWILIO_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM       = process.env.TWILIO_FROM;       // Your Twilio phone number  e.g. +18127922721
-const TEAM_NOTIFY_TO    = process.env.TEAM_NOTIFY_TO;    // Number to receive repair alerts (Mohammad's number)
+const TEAM_NOTIFY_TO    = '+16473857954';    // Number to receive repair alerts (Mohammad's number)
 const client            = twilio(TWILIO_SID, TWILIO_AUTH_TOKEN);
 
 // ── YOUR QUOTE FORM LINK ──
