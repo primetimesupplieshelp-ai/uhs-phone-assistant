@@ -25,11 +25,18 @@ const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; //
 const repairSessions  = {};
 const installSessions = {};
 
-// ── SSML HELPER: wrap text in Polly Joanna at ~10% slower rate ──
-// Twilio supports SSML via <Say> when using Polly voices.
-// We use prosody rate="90%" (100% is normal, 90% is 10% slower).
-function ssml(text) {
-  return `<speak><prosody rate="90%">${text}</prosody></speak>`;
+// ── VOICE HELPER: Polly Joanna at ~10% slower rate ──
+// The Twilio library escapes any text passed to say(), so a hand-written "<speak><prosody>" string was
+// sent as plain text (the slow-down never applied). sayTo() builds real SSML with the library instead.
+// Put [[digits:1234]] in the text to have a number read digit by digit.
+function sayTo(node, text) {
+  const say = node.say({ voice: 'Polly.Joanna', language: 'en-US' });
+  const pros = say.prosody({ rate: '90%' });
+  String(text).split(/(\[\[digits:[^\]]*\]\])/).forEach(part => {
+    const m = part.match(/^\[\[digits:([^\]]*)\]\]$/);
+    if (m) pros.sayAs({ 'interpret-as': 'digits' }, m[1]);
+    else if (part) pros.addText(part);
+  });
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -45,22 +52,14 @@ app.post('/voice', (req, res) => {
     timeout:   12,
   });
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(
-      `Thank you for calling UHS, your trusted home comfort provider. ` +
+  sayTo(gather, `Thank you for calling UHS, your trusted home comfort provider. ` +
       `For us to better assist you, please select from the following options. ` +
       `Press 1 for all Installation or Home Assessment Requests. ` +
       `Press 2 for all Repair Requests. ` +
-      `To repeat this menu, press 9.`
-    )
-  );
+      `To repeat this menu, press 9.`);
 
   // No input fallback
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not receive your selection. Please call back and try again. Thank you for calling UHS. Goodbye.`)
-  );
+  sayTo(twiml, `We did not receive your selection. Please call back and try again. Thank you for calling UHS. Goodbye.`);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -86,49 +85,23 @@ app.post('/voice/menu', (req, res) => {
       speechTimeout: 'auto',
     });
 
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Great, we would be happy to help with your installation or home assessment request. ` +
+    sayTo(gather, `Great, we would be happy to help with your installation or home assessment request. ` +
         `To get you scheduled as quickly as possible, we just need a few quick details. ` +
-        `First, please say your full name.`
-      )
-    );
+        `First, please say your full name.`);
 
     twiml.redirect('/voice/install/name-retry');
 
   } else if (digit === '2') {
-    // ── OPTION 2: Repair Requests — begin data collection ──
-    repairSessions[callerPhone] = { step: 'name' };
-
-    const gather = twiml.gather({
-      input:         'speech',
-      action:        '/voice/repair/name',
-      method:        'POST',
-      timeout:        8,
-      speechTimeout: 'auto',
-    });
-
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `No problem at all — we are here to help! ` +
-        `For our team to contact and schedule your repair as soon as possible, ` +
-        `we just need to collect a few quick details from you. ` +
-        `First, please say your full name`
-      )
-    );
-
-    twiml.redirect('/voice/repair/name-retry');
+    // ── OPTION 2: Repair Requests — start with the issue ──
+    repairSessions[callerPhone] = { step: 'issue' };
+    gatherRepairIssue(twiml, `No problem at all, we are here to help. What is the issue you are calling about today?`);
+    twiml.redirect('/voice/repair/issue-retry');
 
   } else if (digit === '9') {
     twiml.redirect('/voice');
 
   } else {
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(`Sorry, that was not a valid selection. Let us try again.`)
-    );
+    sayTo(twiml, `Sorry, that was not a valid selection. Let us try again.`);
     twiml.redirect('/voice');
   }
 
@@ -158,13 +131,8 @@ app.post('/voice/install/name', (req, res) => {
       speechTimeout: 'auto',
     });
 
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Thank you, ${speechResult}. ` +
-        `Next, please say your full home address, including your street number, street name, and city.`
-      )
-    );
+    sayTo(gather, `Thank you, ${speechResult}. ` +
+        `Next, please say your full home address, including your street number, street name, and city.`);
 
     twiml.redirect('/voice/install/address-retry');
   } else {
@@ -186,15 +154,9 @@ app.post('/voice/install/name-retry', (req, res) => {
     speechTimeout: 'auto',
   });
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch your name. Please say your full name now.`)
-  );
+  sayTo(gather, `We did not catch your name. Please say your full name now.`);
 
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your information. Please call us back and try again. Thank you for calling UHS.`)
-  );
+  sayTo(twiml, `We were unable to capture your information. Please call us back and try again. Thank you for calling UHS.`);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -220,13 +182,8 @@ app.post('/voice/install/address', (req, res) => {
       speechTimeout: 'auto',
     });
 
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Got it, thank you. Lastly, please briefly tell us what you are interested in — ` +
-        `for example, a new furnace, air conditioner, water heater, or a free home comfort assessment.`
-      )
-    );
+    sayTo(gather, `Got it, thank you. Lastly, please briefly tell us what you are interested in — ` +
+        `for example, a new furnace, air conditioner, water heater, or a free home comfort assessment.`);
 
     twiml.redirect('/voice/install/details-retry');
   } else {
@@ -248,15 +205,9 @@ app.post('/voice/install/address-retry', (req, res) => {
     speechTimeout: 'auto',
   });
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch your address. Please say your full home address now, including your city.`)
-  );
+  sayTo(gather, `We did not catch your address. Please say your full home address now, including your city.`);
 
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your address. Please call us back. Thank you for calling UHS.`)
-  );
+  sayTo(twiml, `We were unable to capture your address. Please call us back. Thank you for calling UHS.`);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -284,17 +235,12 @@ app.post('/voice/install/details', (req, res) => {
       timeout:   12,
     });
 
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Thank you. Before we submit your request, let me confirm the details we have on file. ` +
+    sayTo(gather, `Thank you. Before we submit your request, let me confirm the details we have on file. ` +
         `Name: ${session.name}. ` +
         `Address: ${session.address}. ` +
         `Regarding: ${session.details}. ` +
         `If this information is correct, please press 1 to confirm and submit your request. ` +
-        `If any of this information is incorrect and you would like to start over, please press 2.`
-      )
-    );
+        `If any of this information is incorrect and you would like to start over, please press 2.`);
 
     twiml.redirect('/voice/install/confirm-retry');
   } else {
@@ -316,15 +262,9 @@ app.post('/voice/install/details-retry', (req, res) => {
     speechTimeout: 'auto',
   });
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch that. Please briefly describe what you are interested in now.`)
-  );
+  sayTo(gather, `We did not catch that. Please briefly describe what you are interested in now.`);
 
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your details. Please call us back. Thank you for calling UHS.`)
-  );
+  sayTo(twiml, `We were unable to capture your details. Please call us back. Thank you for calling UHS.`);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -355,7 +295,7 @@ app.post('/voice/install/confirm', (req, res) => {
       `Address: ${address}\n` +
       `Regarding: ${details}\n` +
       `──────────────────────────\n` +
-      `Please contact this customer within 24 hours to schedule their free assessment.`;
+      `⏰ Customer was promised a call back WITHIN 1 HOUR to schedule their free assessment.`;
 
     client.messages.create({
       body: teamMessage,
@@ -370,7 +310,7 @@ app.post('/voice/install/confirm', (req, res) => {
     // Confirm to customer via SMS (no quote-form link — callback only)
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS regarding your installation or home assessment request. ` +
-      `One of our advisors will be in touch within 24 hours to schedule your free assessment. ` +
+      `One of our comfort advisors will call you back within the next hour to schedule your free assessment. ` +
       `We appreciate your patience! – UHS Team`;
 
     client.messages.create({
@@ -386,16 +326,11 @@ app.post('/voice/install/confirm', (req, res) => {
     // Clean up session
     delete installSessions[callerPhone];
 
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Perfect — your request has been submitted. ` +
-        `One of our comfort advisors will contact you within 24 hours ` +
+    sayTo(twiml, `Perfect — your request has been submitted. ` +
+        `One of our comfort advisors will call you back within the next hour ` +
         `to schedule your free home assessment. ` +
         `We have also sent a confirmation text message to this number. ` +
-        `Thank you so much for calling UHS. Have a wonderful day!`
-      )
-    );
+        `Thank you so much for calling UHS. Have a wonderful day!`);
 
     twiml.hangup();
 
@@ -404,10 +339,7 @@ app.post('/voice/install/confirm', (req, res) => {
     if (installSessions[callerPhone]) delete installSessions[callerPhone];
     installSessions[callerPhone] = { step: 'name' };
 
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(`No problem at all. Let us start over. We will collect your details again from the beginning.`)
-    );
+    sayTo(twiml, `No problem at all. Let us start over. We will collect your details again from the beginning.`);
 
     twiml.redirect('/voice/install/name-retry');
 
@@ -425,10 +357,7 @@ app.post('/voice/install/confirm-retry', (req, res) => {
   const twiml       = new twilio.twiml.VoiceResponse();
 
   if (!session) {
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(`We encountered an issue with your session. Please call us back. Thank you for calling UHS.`)
-    );
+    sayTo(twiml, `We encountered an issue with your session. Please call us back. Thank you for calling UHS.`);
     twiml.hangup();
     res.type('text/xml');
     return res.send(twiml.toString());
@@ -441,224 +370,221 @@ app.post('/voice/install/confirm-retry', (req, res) => {
     timeout:   12,
   });
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(
-      `We did not receive your selection. Let me repeat the details once more. ` +
+  sayTo(gather, `We did not receive your selection. Let me repeat the details once more. ` +
       `Name: ${session.name}. ` +
       `Address: ${session.address}. ` +
       `Regarding: ${session.details}. ` +
-      `Press 1 to confirm and submit, or press 2 to start over.`
-    )
-  );
+      `Press 1 to confirm and submit, or press 2 to start over.`);
 
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`)
-  );
+  sayTo(twiml, `We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`);
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
 // ────────────────────────────────────────────────────────────────
-// REPAIR FLOW — Step 1: Collect Name
+// REPAIR FLOW (Option 2)
+//   Step 1  Issue    → "Amazing… flat $90 repair fee…"
+//   Step 2  Address  → "Great, that is within our service area…"
+//   Step 3  Name
+//   Step 4  Phone    → press 1 to use the number they are calling from, or key in another
+//   Step 5  Quick confirm → submit, text the team + customer, callback within the hour
 // ────────────────────────────────────────────────────────────────
-app.post('/voice/repair/name', (req, res) => {
-  const callerPhone  = req.body.From;
-  const speechResult = (req.body.SpeechResult || '').trim();
-  const twiml        = new twilio.twiml.VoiceResponse();
+const REPAIR_FLAT_FEE = '$90';
 
-  if (!repairSessions[callerPhone]) repairSessions[callerPhone] = {};
-
-  if (speechResult) {
-    repairSessions[callerPhone].name = speechResult;
-    repairSessions[callerPhone].step = 'address';
-
-    const gather = twiml.gather({
-      input:         'speech',
-      action:        '/voice/repair/address',
-      method:        'POST',
-      timeout:        10,
-      speechTimeout: 'auto',
-    });
-
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Thank you, ${speechResult}. ` +
-        `Next, please say your full service address, including your street number, street name, and city.`
-      )
-    );
-
-    twiml.redirect('/voice/repair/address-retry');
-  } else {
-    twiml.redirect('/voice/repair/name-retry');
-  }
-
+// Callers' words can't contain the [[digits:]] marker used by sayTo().
+function clean(s) {
+  return String(s || '').replace(/\[\[|\]\]/g, '');
+}
+function digitsSsml(num) {
+  return `[[digits:${String(num).replace(/\D/g, '')}]]`;
+}
+function formatPhone(raw) {
+  const d = String(raw || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  return d.length === 10 ? `+1${d}` : String(raw || '');
+}
+function lastFour(phone) {
+  return String(phone || '').replace(/\D/g, '').slice(-4);
+}
+function sendXml(res, twiml) {
   res.type('text/xml');
   res.send(twiml.toString());
-});
-
-app.post('/voice/repair/name-retry', (req, res) => {
+}
+function repairSessionLost(res) {
   const twiml = new twilio.twiml.VoiceResponse();
+  sayTo(twiml, `Sorry, we lost your details. Please call us back and we will be happy to help. Thank you for calling UHS.`);
+  twiml.hangup();
+  sendXml(res, twiml);
+}
 
+// ── Step 1: Issue ──
+function gatherRepairIssue(twiml, prompt) {
   const gather = twiml.gather({
-    input:         'speech',
-    action:        '/voice/repair/name',
-    method:        'POST',
-    timeout:        8,
-    speechTimeout: 'auto',
+    input: 'speech', action: '/voice/repair/issue', method: 'POST', timeout: 10, speechTimeout: 'auto',
   });
+  sayTo(gather, prompt);
+}
 
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch your name. Please say your full name now.`)
-  );
-
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your information. Please call us back and try again. Thank you for calling UHS.`)
-  );
-
-  res.type('text/xml');
-  res.send(twiml.toString());
-});
-
-// ────────────────────────────────────────────────────────────────
-// REPAIR FLOW — Step 2: Collect Address
-// ────────────────────────────────────────────────────────────────
-app.post('/voice/repair/address', (req, res) => {
-  const callerPhone  = req.body.From;
-  const speechResult = (req.body.SpeechResult || '').trim();
-  const twiml        = new twilio.twiml.VoiceResponse();
-
-  if (speechResult) {
-    repairSessions[callerPhone].address = speechResult;
-    repairSessions[callerPhone].step    = 'issue';
-
-    const gather = twiml.gather({
-      input:         'speech',
-      action:        '/voice/repair/issue',
-      method:        'POST',
-      timeout:        12,
-      speechTimeout: 'auto',
-    });
-
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Got it, thank you. Now please briefly describe the issue you are experiencing with your system. ` +
-        `For example: my furnace is not producing heat, my air conditioner is making an unusual noise, ` +
-        `or my water heater has stopped providing hot water.`
-      )
-    );
-
-    twiml.redirect('/voice/repair/issue-retry');
-  } else {
-    twiml.redirect('/voice/repair/address-retry');
-  }
-
-  res.type('text/xml');
-  res.send(twiml.toString());
-});
-
-app.post('/voice/repair/address-retry', (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-
-  const gather = twiml.gather({
-    input:         'speech',
-    action:        '/voice/repair/address',
-    method:        'POST',
-    timeout:        10,
-    speechTimeout: 'auto',
-  });
-
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch your address. Please say your full service address now, including your city.`)
-  );
-
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your address. Please call us back. Thank you for calling UHS.`)
-  );
-
-  res.type('text/xml');
-  res.send(twiml.toString());
-});
-
-// ────────────────────────────────────────────────────────────────
-// REPAIR FLOW — Step 3: Collect Issue
-// ────────────────────────────────────────────────────────────────
 app.post('/voice/repair/issue', (req, res) => {
   const callerPhone  = req.body.From;
   const speechResult = (req.body.SpeechResult || '').trim();
   const twiml        = new twilio.twiml.VoiceResponse();
 
-  if (speechResult && repairSessions[callerPhone]) {
-    repairSessions[callerPhone].issue = speechResult;
-    repairSessions[callerPhone].step  = 'confirm';
-
-    const session = repairSessions[callerPhone];
-
-    // ── Step 3.4: Read back details and ask for confirmation ──
-    const gather = twiml.gather({
-      numDigits: 1,
-      action:    '/voice/repair/confirm',
-      method:    'POST',
-      timeout:   12,
-    });
-
-    gather.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Thank you. Before we submit your request, let me confirm the details we have on file. ` +
-        `Name: ${session.name}. ` +
-        `Address: ${session.address}. ` +
-        `Issue: ${session.issue}. ` +
-        `If this information is correct, please press 1 to confirm and submit your request. ` +
-        `If any of this information is incorrect and you would like to start over, please press 2.`
-      )
-    );
-
-    twiml.redirect('/voice/repair/confirm-retry');
-  } else {
+  if (!speechResult) {
     twiml.redirect('/voice/repair/issue-retry');
+    return sendXml(res, twiml);
   }
 
-  res.type('text/xml');
-  res.send(twiml.toString());
+  repairSessions[callerPhone] = Object.assign(repairSessions[callerPhone] || {}, { issue: speechResult, step: 'address' });
+
+  const gather = twiml.gather({
+    input: 'speech', action: '/voice/repair/address', method: 'POST', timeout: 10, speechTimeout: 'auto',
+  });
+  sayTo(gather,
+    `Amazing. Our technicians are specialized in repairing exactly this type of issue. ` +
+    `We charge a flat ${REPAIR_FLAT_FEE} fee for your repair, as long as no additional parts are required. ` +
+    `Please share your exact address, including your street number, street name and city, ` +
+    `so we can check that our local technician is in your area.`
+  );
+  twiml.redirect('/voice/repair/address-retry');
+  sendXml(res, twiml);
 });
 
 app.post('/voice/repair/issue-retry', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-
-  const gather = twiml.gather({
-    input:         'speech',
-    action:        '/voice/repair/issue',
-    method:        'POST',
-    timeout:        12,
-    speechTimeout: 'auto',
-  });
-
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We did not catch your issue. Please describe your HVAC problem now.`)
-  );
-
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to capture your issue. Please call us back. Thank you for calling UHS.`)
-  );
-
-  res.type('text/xml');
-  res.send(twiml.toString());
+  gatherRepairIssue(twiml, `Sorry, we did not catch that. Please briefly tell us what issue you are calling about today.`);
+  sayTo(twiml, `We were unable to capture your issue. Please call us back. Thank you for calling UHS.`);
+  sendXml(res, twiml);
 });
 
-// ────────────────────────────────────────────────────────────────
-// REPAIR FLOW — Step 3.4: Confirmation
-// ────────────────────────────────────────────────────────────────
+// ── Step 2: Address ──
+app.post('/voice/repair/address', (req, res) => {
+  const callerPhone  = req.body.From;
+  const speechResult = (req.body.SpeechResult || '').trim();
+  const twiml        = new twilio.twiml.VoiceResponse();
+
+  if (!repairSessions[callerPhone]) return repairSessionLost(res);
+  if (!speechResult) {
+    twiml.redirect('/voice/repair/address-retry');
+    return sendXml(res, twiml);
+  }
+
+  repairSessions[callerPhone].address = speechResult;
+  repairSessions[callerPhone].step    = 'name';
+
+  const gather = twiml.gather({
+    input: 'speech', action: '/voice/repair/name', method: 'POST', timeout: 8, speechTimeout: 'auto',
+  });
+  sayTo(gather,
+    `Great, that is within our service area. ` +
+    `Please share your full name so our technician can call you back within the next hour.`
+  );
+  twiml.redirect('/voice/repair/name-retry');
+  sendXml(res, twiml);
+});
+
+app.post('/voice/repair/address-retry', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const gather = twiml.gather({
+    input: 'speech', action: '/voice/repair/address', method: 'POST', timeout: 10, speechTimeout: 'auto',
+  });
+  sayTo(gather, `Sorry, we did not catch your address. Please say your exact address, including your city.`);
+  sayTo(twiml, `We were unable to capture your address. Please call us back. Thank you for calling UHS.`);
+  sendXml(res, twiml);
+});
+
+// ── Step 3: Name ──
+function gatherRepairPhone(twiml, callerPhone, prefix) {
+  const gather = twiml.gather({
+    input: 'dtmf', action: '/voice/repair/phone', method: 'POST', timeout: 6, finishOnKey: '#',
+  });
+  const four = lastFour(callerPhone);
+  sayTo(gather,
+    (prefix || '') +
+    (four
+      ? `If the number ending in ${digitsSsml(four)} is the best number to reach you, press 1. `
+      : '') +
+    `Otherwise, enter your 10 digit phone number now, followed by the pound key.`
+  );
+}
+
+app.post('/voice/repair/name', (req, res) => {
+  const callerPhone  = req.body.From;
+  const speechResult = (req.body.SpeechResult || '').trim();
+  const twiml        = new twilio.twiml.VoiceResponse();
+
+  if (!repairSessions[callerPhone]) return repairSessionLost(res);
+  if (!speechResult) {
+    twiml.redirect('/voice/repair/name-retry');
+    return sendXml(res, twiml);
+  }
+
+  repairSessions[callerPhone].name = speechResult;
+  repairSessions[callerPhone].step = 'phone';
+
+  gatherRepairPhone(twiml, callerPhone, `Thank you, ${clean(speechResult)}. `);
+  twiml.redirect('/voice/repair/phone-retry');
+  sendXml(res, twiml);
+});
+
+app.post('/voice/repair/name-retry', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const gather = twiml.gather({
+    input: 'speech', action: '/voice/repair/name', method: 'POST', timeout: 8, speechTimeout: 'auto',
+  });
+  sayTo(gather, `Sorry, we did not catch your name. Please say your full name now.`);
+  sayTo(twiml, `We were unable to capture your information. Please call us back and try again. Thank you for calling UHS.`);
+  sendXml(res, twiml);
+});
+
+// ── Step 4: Phone number ──
+app.post('/voice/repair/phone', (req, res) => {
+  const callerPhone = req.body.From;
+  const digits      = String(req.body.Digits || '').replace(/\D/g, '');
+  const twiml       = new twilio.twiml.VoiceResponse();
+  const session     = repairSessions[callerPhone];
+
+  if (!session) return repairSessionLost(res);
+
+  let phone = null;
+  if (digits === '1' && lastFour(callerPhone)) phone = callerPhone;
+  else if (digits.length === 10 || (digits.length === 11 && digits[0] === '1')) phone = formatPhone(digits);
+
+  if (!phone) {
+    twiml.redirect('/voice/repair/phone-retry');
+    return sendXml(res, twiml);
+  }
+
+  session.phone = phone;
+  session.step  = 'confirm';
+  readBackRepair(twiml, session, `Thank you. `);
+  twiml.redirect('/voice/repair/confirm-retry');
+  sendXml(res, twiml);
+});
+
+app.post('/voice/repair/phone-retry', (req, res) => {
+  const callerPhone = req.body.From;
+  const twiml       = new twilio.twiml.VoiceResponse();
+  if (!repairSessions[callerPhone]) return repairSessionLost(res);
+  gatherRepairPhone(twiml, callerPhone, `Sorry, we did not get a valid number. `);
+  sayTo(twiml, `We were unable to capture your phone number. Please call us back. Thank you for calling UHS.`);
+  sendXml(res, twiml);
+});
+
+// ── Step 5: Quick confirmation ──
+function readBackRepair(twiml, session, prefix) {
+  const gather = twiml.gather({
+    numDigits: 1, action: '/voice/repair/confirm', method: 'POST', timeout: 10,
+  });
+  sayTo(gather,
+    (prefix || '') +
+    `To confirm: ${clean(session.name)}, at ${clean(session.address)}, ` +
+    `phone number ${digitsSsml(String(session.phone).replace(/^\+1/, ''))}, ` +
+    `calling about ${clean(session.issue)}. ` +
+    `Press 1 if this is correct, or press 2 to start over.`
+  );
+}
+
 app.post('/voice/repair/confirm', (req, res) => {
   const callerPhone = req.body.From;
   const digit       = req.body.Digits;
@@ -666,11 +592,10 @@ app.post('/voice/repair/confirm', (req, res) => {
   const session     = repairSessions[callerPhone];
 
   if (digit === '1' && session) {
-    // ── Confirmed — send notifications ──
     const name    = session.name    || 'Unknown';
     const address = session.address || 'Unknown';
     const issue   = session.issue   || 'Unknown';
-    const phone   = callerPhone;
+    const phone   = session.phone   || callerPhone;
 
     // Notify UHS team via SMS
     const teamMessage =
@@ -678,15 +603,17 @@ app.post('/voice/repair/confirm', (req, res) => {
       `──────────────────────────\n` +
       `Name:    ${name}\n` +
       `Phone:   ${phone}\n` +
+      (phone !== callerPhone ? `Called from: ${callerPhone}\n` : '') +
       `Address: ${address}\n` +
       `Issue:   ${issue}\n` +
+      `Quoted:  ${REPAIR_FLAT_FEE} flat repair fee (no additional parts)\n` +
       `──────────────────────────\n` +
-      `Please contact the customer as soon as possible to schedule their repair for today or tomorrow.`;
+      `⏰ Customer was promised a call back WITHIN 1 HOUR.`;
 
     client.messages.create({
       body: teamMessage,
       from: TWILIO_FROM,
-      to:   TEAM_NOTIFY_TO || TWILIO_FROM, // Falls back to Twilio number if TEAM_NOTIFY_TO not set
+      to:   TEAM_NOTIFY_TO || TWILIO_FROM,
     }).then(() => {
       console.log(`✅ Repair request SMS sent to UHS team`);
     }).catch(err => {
@@ -695,10 +622,9 @@ app.post('/voice/repair/confirm', (req, res) => {
 
     // Confirm to customer via SMS
     const customerMessage =
-      `Hi ${name}! Thank you for contacting UHS regarding your repair request. ` +
-      `We have received all of your details and one of our licensed technicians ` +
-      `will be in touch with you as soon as possible to schedule your repair for today or tomorrow. ` +
-      `We appreciate your patience! – UHS Team`;
+      `Hi ${name}! Thank you for contacting UHS about your repair. ` +
+      `Our technician will call you back within the next hour. ` +
+      `Your repair is a flat ${REPAIR_FLAT_FEE} fee as long as no additional parts are required. – UHS Team`;
 
     client.messages.create({
       body: customerMessage,
@@ -710,40 +636,25 @@ app.post('/voice/repair/confirm', (req, res) => {
       console.error(`❌ Failed to send repair confirm SMS:`, err.message);
     });
 
-    // Clean up session
     delete repairSessions[callerPhone];
 
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(
-        `Your repair request has been successfully submitted. ` +
-        `One of our licensed technicians will contact you as soon as possible ` +
-        `to schedule your repair for today or tomorrow. ` +
-        `We have also sent a confirmation text message to this number with your request details. ` +
-        `Thank you so much for calling UHS. We will be in touch very shortly. Have a great day!`
-      )
+    sayTo(twiml,
+      `Perfect, your repair request has been submitted. ` +
+      `Our technician will call you back within the next hour, and we have sent you a confirmation text. ` +
+      `Thank you for calling UHS. Have a great day!`
     );
-
     twiml.hangup();
 
   } else if (digit === '2') {
-    // ── Start over ──
-    if (repairSessions[callerPhone]) delete repairSessions[callerPhone];
-    repairSessions[callerPhone] = { step: 'name' };
-
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(`No problem at all. Let us start over. We will collect your details again from the beginning.`)
-    );
-
-    twiml.redirect('/voice/repair/name-retry');
+    repairSessions[callerPhone] = { step: 'issue' };
+    gatherRepairIssue(twiml, `No problem, let us start over. What is the issue you are calling about today?`);
+    twiml.redirect('/voice/repair/issue-retry');
 
   } else {
     twiml.redirect('/voice/repair/confirm-retry');
   }
 
-  res.type('text/xml');
-  res.send(twiml.toString());
+  sendXml(res, twiml);
 });
 
 app.post('/voice/repair/confirm-retry', (req, res) => {
@@ -751,41 +662,11 @@ app.post('/voice/repair/confirm-retry', (req, res) => {
   const session     = repairSessions[callerPhone];
   const twiml       = new twilio.twiml.VoiceResponse();
 
-  if (!session) {
-    twiml.say(
-      { voice: 'Polly.Joanna', language: 'en-US' },
-      ssml(`We encountered an issue with your session. Please call us back. Thank you for calling UHS.`)
-    );
-    twiml.hangup();
-    res.type('text/xml');
-    return res.send(twiml.toString());
-  }
+  if (!session || !session.phone) return repairSessionLost(res);
 
-  const gather = twiml.gather({
-    numDigits: 1,
-    action:    '/voice/repair/confirm',
-    method:    'POST',
-    timeout:   12,
-  });
-
-  gather.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(
-      `We did not receive your selection. Let me repeat the details once more. ` +
-      `Name: ${session.name}. ` +
-      `Address: ${session.address}. ` +
-      `Issue: ${session.issue}. ` +
-      `Press 1 to confirm and submit, or press 2 to start over.`
-    )
-  );
-
-  twiml.say(
-    { voice: 'Polly.Joanna', language: 'en-US' },
-    ssml(`We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`)
-  );
-
-  res.type('text/xml');
-  res.send(twiml.toString());
+  readBackRepair(twiml, session, `We did not receive your selection. `);
+  sayTo(twiml, `We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`);
+  sendXml(res, twiml);
 });
 
 // ── START SERVER ──
