@@ -7,6 +7,45 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 
+// ── DELIVERY TRACKING ──
+// Twilio reports each text's final status (delivered / undelivered / failed + error code) to /sms-status,
+// and it is printed in the Railway logs. "✅ ... sent" only means Twilio ACCEPTED the message;
+// the 📬 line that follows a few seconds later tells you whether the phone actually received it.
+let PUBLIC_BASE = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+app.use((req, res, next) => {
+  if (!PUBLIC_BASE && req.get('host')) PUBLIC_BASE = `https://${req.get('host')}`;
+  next();
+});
+function sendMsg(opts) {
+  const o = PUBLIC_BASE ? Object.assign({ statusCallback: `${PUBLIC_BASE}/sms-status` }, opts) : opts;
+  return client.messages.create(o).then(m => {
+    console.log(`📨 Twilio accepted ${m.sid} → ${opts.to}${opts.mediaUrl ? ' (with video)' : ''}`);
+    return m;
+  });
+}
+const SMS_ERRORS = {
+  '30003': 'phone unreachable / switched off',
+  '30004': 'message blocked by the recipient (or they replied STOP)',
+  '30005': 'unknown or inactive phone number',
+  '30006': 'landline or number cannot receive texts',
+  '30007': 'carrier filtered it as spam — register a toll-free/A2P sender',
+  '30008': 'unknown carrier error',
+  '30019': 'video too large for this carrier',
+  '30032': 'toll-free number not verified',
+  '30034': 'US number not registered for A2P 10DLC',
+  '21610': 'recipient previously replied STOP',
+  '11751': 'video too large for this carrier',
+};
+app.post('/sms-status', (req, res) => {
+  const { MessageSid, MessageStatus, To, ErrorCode } = req.body;
+  if (['delivered', 'undelivered', 'failed', 'sent'].includes(MessageStatus)) {
+    const icon = MessageStatus === 'delivered' ? '📬' : MessageStatus === 'sent' ? '📤' : '🚫';
+    console.log(`${icon} ${MessageSid} → ${To}: ${MessageStatus}` +
+      (ErrorCode ? ` (error ${ErrorCode}${SMS_ERRORS[ErrorCode] ? ': ' + SMS_ERRORS[ErrorCode] : ''})` : ''));
+  }
+  res.sendStatus(204);
+});
+
 // ── TWILIO CONFIG ──
 // Set these in your Railway environment variables — never hardcode credentials
 const TWILIO_SID        = process.env.TWILIO_SID;
@@ -46,16 +85,78 @@ const VIDEOS = MEDIA_BASE_URL ? {
 function sendCustomerText(to, body, video, label) {
   const base = { body, from: TWILIO_FROM, to };
   const withVideo = video ? Object.assign({}, base, { mediaUrl: [video.mms] }) : base;
-  return client.messages.create(withVideo).then(() => {
+  return sendMsg(withVideo).then(() => {
     console.log(`✅ ${label} text${video ? ' + video' : ''} sent to ${to}`);
   }).catch(err => {
     if (!video) { console.error(`❌ Failed to send ${label} text:`, err.message); return; }
     console.warn(`⚠️ ${label} video could not be attached (${err.message}); sending text only`);
-    return client.messages.create(base).then(() => {
+    return sendMsg(base).then(() => {
       console.log(`✅ ${label} text (no video) sent to ${to}`);
     }).catch(e2 => console.error(`❌ Failed to send ${label} text:`, e2.message));
   });
 }
+
+// ── SELF-CHECK ──
+// Runs when the server starts, and any time you open  https://<your-railway-address>/diagnostics
+// in a browser. It asks Twilio directly why texts are or aren't arriving, and checks the video links.
+// Phone numbers are masked (last 4 digits only).
+const https = require('https');
+const mask = n => (n ? '***' + String(n).replace(/\D/g, '').slice(-4) : n);
+function headCheck(url) {
+  return new Promise(resolve => {
+    try {
+      const r = https.request(url, { method: 'HEAD', timeout: 8000 }, res => {
+        resolve({ url, http: res.statusCode, type: res.headers['content-type'], sizeKB: Math.round((+res.headers['content-length'] || 0) / 1024) });
+      });
+      r.on('error', e => resolve({ url, error: e.message }));
+      r.on('timeout', () => { r.destroy(); resolve({ url, error: 'timed out' }); });
+      r.end();
+    } catch (e) { resolve({ url, error: e.message }); }
+  });
+}
+async function runDiagnostics() {
+  const out = { problems: [] };
+  try {
+    const acct = await client.api.v2010.accounts(TWILIO_SID).fetch();
+    out.account = { type: acct.type, status: acct.status };
+    if (acct.type === 'Trial') out.problems.push('Twilio TRIAL account: it can only text phone numbers verified in the Twilio console (Phone Numbers > Verified Caller IDs). Upgrade the account to text customers.');
+    if (acct.status !== 'active') out.problems.push(`Twilio account status is "${acct.status}" (must be active).`);
+  } catch (e) { out.account = { error: e.message }; out.problems.push('Could not read the Twilio account. Check TWILIO_SID and TWILIO_AUTH_TOKEN in Railway.'); }
+  try {
+    const nums = await client.incomingPhoneNumbers.list({ phoneNumber: TWILIO_FROM, limit: 1 });
+    if (!nums.length) out.problems.push(`TWILIO_FROM (${TWILIO_FROM}) is not a number on this Twilio account.`);
+    else {
+      const n = nums[0];
+      out.fromNumber = { number: n.phoneNumber, sms: n.capabilities.sms, mms: n.capabilities.mms, country: n.phoneNumber.startsWith('+1') ? 'US/Canada' : 'other' };
+      if (!n.capabilities.sms) out.problems.push('Your Twilio number cannot send SMS.');
+      if (!n.capabilities.mms) out.problems.push('Your Twilio number cannot send MMS (videos). Texts will go out without the video.');
+    }
+  } catch (e) { out.fromNumber = { error: e.message }; }
+  try {
+    const msgs = await client.messages.list({ from: TWILIO_FROM, limit: 6 });
+    out.recentTexts = msgs.map(m => ({
+      sent: m.dateCreated, to: mask(m.to), status: m.status, video: +m.numMedia > 0,
+      error: m.errorCode ? `${m.errorCode}: ${SMS_ERRORS[m.errorCode] || m.errorMessage || 'see twilio.com/docs/api/errors/' + m.errorCode}` : null,
+    }));
+    const codes = [...new Set(msgs.filter(m => m.errorCode).map(m => String(m.errorCode)))];
+    codes.forEach(c => out.problems.push(`Recent texts failed with error ${c}: ${SMS_ERRORS[c] || 'see https://www.twilio.com/docs/api/errors/' + c}`));
+    const bad = msgs.filter(m => ['undelivered', 'failed'].includes(m.status) && !m.errorCode).length;
+    if (bad) out.problems.push(`${bad} recent text(s) were not delivered (no error code given). Open the message in the Twilio console (Monitor > Logs > Messaging) for details.`);
+  } catch (e) { out.recentTexts = { error: e.message }; }
+  if (VIDEOS) {
+    out.videos = await Promise.all([VIDEOS.repair.mms, VIDEOS.assessment.mms, VIDEOS.repair.hd, VIDEOS.assessment.hd].map(headCheck));
+    out.videos.forEach(v => {
+      if (v.error || v.http !== 200) out.problems.push(`Video not reachable: ${v.url} (${v.error || 'HTTP ' + v.http}). Check the Netlify upload and MEDIA_BASE_URL.`);
+      else if (!/video\/mp4/.test(v.type || '')) out.problems.push(`Video served with wrong type "${v.type}": ${v.url}`);
+      else if (/_MMS\.mp4$/.test(v.url) && v.sizeKB > 600) out.problems.push(`Text-message video is ${v.sizeKB} KB (keep under 600 KB): ${v.url}`);
+    });
+  } else out.videos = 'MEDIA_BASE_URL not set: texts are sent without video';
+  if (!out.problems.length) out.problems.push('No problems found.');
+  return out;
+}
+app.get('/diagnostics', async (req, res) => {
+  res.json(await runDiagnostics());
+});
 
 // ── IN-MEMORY SESSION STORES ──
 const repairSessions  = {};
@@ -324,16 +425,16 @@ app.post('/voice/install/confirm', (req, res) => {
 
     // Notify UHS team via SMS
     const teamMessage =
-      `🏠 NEW INSTALLATION/ASSESSMENT LEAD — UHS\n` +
-      `──────────────────────────\n` +
+      `NEW INSTALLATION/ASSESSMENT LEAD - UHS\n` +
+      `--------------------------\n` +
       `Name:    ${name}\n` +
       `Phone:   ${phone}\n` +
       `Address: ${address}\n` +
       `Regarding: ${details}\n` +
-      `──────────────────────────\n` +
-      `⏰ Customer was promised a call back WITHIN 1 HOUR to schedule their free assessment.`;
+      `--------------------------\n` +
+      `Customer was promised a call back WITHIN 1 HOUR to schedule their free assessment.`;
 
-    client.messages.create({
+    sendMsg({
       body: teamMessage,
       from: TWILIO_FROM,
       to:   TEAM_NOTIFY_TO || TWILIO_FROM, // Falls back to Twilio number if TEAM_NOTIFY_TO not set
@@ -347,7 +448,7 @@ app.post('/voice/install/confirm', (req, res) => {
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS regarding your installation or home assessment request. ` +
       `One of our comfort advisors will call you back within the next hour to schedule your free assessment. ` +
-      `We appreciate your patience! – UHS Team` +
+      `We appreciate your patience! - UHS Team` +
       (VIDEOS ? `\n\nMeet your comfort advisor (HD video): ${VIDEOS.assessment.hd}` : '');
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.assessment, 'Installation/assessment confirmation');
@@ -414,7 +515,7 @@ app.post('/voice/install/confirm-retry', (req, res) => {
 
 // ────────────────────────────────────────────────────────────────
 // REPAIR FLOW (Option 2)
-//   Step 1  Issue    → "Amazing… flat $90 repair fee…"
+//   Step 1  Issue    → "Sure… flat $90 repair fee…"
 //   Step 2  Address  → "Great, that is within our service area…"
 //   Step 3  Name
 //   Step 4  Phone    → press 1 to use the number they are calling from, or key in another
@@ -471,7 +572,7 @@ app.post('/voice/repair/issue', (req, res) => {
     input: 'speech', action: '/voice/repair/address', method: 'POST', timeout: 10, speechTimeout: 'auto',
   });
   sayTo(gather,
-    `Amazing. Our technicians are specialized in repairing exactly this type of issue. ` +
+    `Sure. Our technicians are specialized in repairing exactly this type of issue. ` +
     `We charge a flat ${REPAIR_FLAT_FEE} fee for your repair, as long as no additional parts are required. ` +
     `Please share your exact address, including your street number, street name and city, ` +
     `so we can check that our local technician is in your area.`
@@ -629,18 +730,18 @@ app.post('/voice/repair/confirm', (req, res) => {
 
     // Notify UHS team via SMS
     const teamMessage =
-      `🔧 NEW REPAIR REQUEST — UHS\n` +
-      `──────────────────────────\n` +
+      `NEW REPAIR REQUEST - UHS\n` +
+      `--------------------------\n` +
       `Name:    ${name}\n` +
       `Phone:   ${phone}\n` +
       (phone !== callerPhone ? `Called from: ${callerPhone}\n` : '') +
       `Address: ${address}\n` +
       `Issue:   ${issue}\n` +
       `Quoted:  ${REPAIR_FLAT_FEE} flat repair fee (no additional parts)\n` +
-      `──────────────────────────\n` +
-      `⏰ Customer was promised a call back WITHIN 1 HOUR.`;
+      `--------------------------\n` +
+      `Customer was promised a call back WITHIN 1 HOUR.`;
 
-    client.messages.create({
+    sendMsg({
       body: teamMessage,
       from: TWILIO_FROM,
       to:   TEAM_NOTIFY_TO || TWILIO_FROM,
@@ -654,7 +755,7 @@ app.post('/voice/repair/confirm', (req, res) => {
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS about your repair. ` +
       `Our technician will call you back within the next hour. ` +
-      `We look forward to serving you. – UHS Team` +
+      `We look forward to serving you. - UHS Team` +
       (VIDEOS ? `\n\nMeet your technician (HD video): ${VIDEOS.repair.hd}` : '');
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.repair, 'Repair confirmation');
@@ -698,4 +799,10 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 UHS Phone Assistant running on port ${PORT}`);
   console.log(`📞 Webhook endpoint: POST /voice`);
+  runDiagnostics().then(d => {
+    console.log('🩺 Self-check:');
+    d.problems.forEach(p => console.log('   • ' + p));
+    if (Array.isArray(d.recentTexts)) d.recentTexts.forEach(m =>
+      console.log(`   ↳ ${m.sent ? new Date(m.sent).toISOString().slice(0, 16).replace('T', ' ') : ''} to ${m.to}: ${m.status}${m.video ? ' (video)' : ''}${m.error ? ' — error ' + m.error : ''}`));
+  }).catch(e => console.log('🩺 Self-check could not run:', e.message));
 });
