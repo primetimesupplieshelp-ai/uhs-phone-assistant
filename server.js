@@ -63,18 +63,27 @@ const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; //
 // ── WELCOME VIDEOS (sent with the customer's confirmation text) ──
 // Upload the 4 video files to your Netlify site in a folder called "videos", then set
 // MEDIA_BASE_URL in Railway to your site address, e.g. https://your-site.netlify.app
-//   *_MMS.mp4  → small (~580 KB) copy that plays right inside the text message
-//   *_v4.mp4   → full-HD copy, linked in the text for a sharper view
+//   /repair and /assessment → watch pages that play the full-quality video (sent as a link)
+//   *_MMS.mp4  → small (~580 KB) copy, only used when VIDEO_MODE=mms
 // Leave MEDIA_BASE_URL unset to send plain texts with no video.
+//
+// VIDEO_MODE (optional Railway variable):
+//   link (default) → normal text with a link to the full-quality video page. Most phones show
+//                    a preview picture. Best quality, cheapest, and the most reliable delivery.
+//   mms            → also attaches the small video file to the text (carriers shrink it, so it looks
+//                    blurry, and some carriers refuse video texts).
 const MEDIA_BASE_URL = (process.env.MEDIA_BASE_URL || '').replace(/\/+$/, '');
+const VIDEO_MODE = (process.env.VIDEO_MODE || 'link').toLowerCase() === 'mms' ? 'mms' : 'link';
 const VIDEOS = MEDIA_BASE_URL ? {
   repair: {
     mms: `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_v4.mp4`,
+    page: `${MEDIA_BASE_URL}/repair/`,
   },
   assessment: {
     mms: `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_v4.mp4`,
+    page: `${MEDIA_BASE_URL}/assessment/`,
   },
 } : null;
 
@@ -83,6 +92,7 @@ const VIDEOS = MEDIA_BASE_URL ? {
 // automatically re-sends the same text without the video, so the customer always
 // gets their confirmation. The HD link in the text is the backup if a carrier drops the video.
 function sendCustomerText(to, body, video, label) {
+  if (VIDEO_MODE !== 'mms') video = null;   // link mode: the video link is already in the body
   const base = { body, from: TWILIO_FROM, to };
   const withVideo = video ? Object.assign({}, base, { mediaUrl: [video.mms] }) : base;
   return sendMsg(withVideo).then(() => {
@@ -115,7 +125,7 @@ function headCheck(url) {
   });
 }
 async function runDiagnostics() {
-  const out = { problems: [] };
+  const out = { videoMode: VIDEO_MODE, problems: [] };
   try {
     const acct = await client.api.v2010.accounts(TWILIO_SID).fetch();
     out.account = { type: acct.type, status: acct.status };
@@ -129,7 +139,7 @@ async function runDiagnostics() {
       const n = nums[0];
       out.fromNumber = { number: n.phoneNumber, sms: n.capabilities.sms, mms: n.capabilities.mms, country: n.phoneNumber.startsWith('+1') ? 'US/Canada' : 'other' };
       if (!n.capabilities.sms) out.problems.push('Your Twilio number cannot send SMS.');
-      if (!n.capabilities.mms) out.problems.push('Your Twilio number cannot send MMS (videos). Texts will go out without the video.');
+      if (!n.capabilities.mms && VIDEO_MODE === 'mms') out.problems.push('Your Twilio number cannot send MMS (videos). Texts will go out without the video.');
     }
   } catch (e) { out.fromNumber = { error: e.message }; }
   try {
@@ -144,9 +154,12 @@ async function runDiagnostics() {
     if (bad) out.problems.push(`${bad} recent text(s) were not delivered (no error code given). Open the message in the Twilio console (Monitor > Logs > Messaging) for details.`);
   } catch (e) { out.recentTexts = { error: e.message }; }
   if (VIDEOS) {
-    out.videos = await Promise.all([VIDEOS.repair.mms, VIDEOS.assessment.mms, VIDEOS.repair.hd, VIDEOS.assessment.hd].map(headCheck));
+    const urls = [VIDEOS.repair.page, VIDEOS.assessment.page, VIDEOS.repair.hd, VIDEOS.assessment.hd];
+    if (VIDEO_MODE === 'mms') urls.push(VIDEOS.repair.mms, VIDEOS.assessment.mms);
+    out.videos = await Promise.all(urls.map(headCheck));
     out.videos.forEach(v => {
-      if (v.error || v.http !== 200) out.problems.push(`Video not reachable: ${v.url} (${v.error || 'HTTP ' + v.http}). Check the Netlify upload and MEDIA_BASE_URL.`);
+      if (v.error || v.http !== 200) out.problems.push(`Video link not reachable: ${v.url} (${v.error || 'HTTP ' + v.http}). Check the Netlify upload and MEDIA_BASE_URL.`);
+      else if (/\/$/.test(v.url)) { if (!/text\/html/.test(v.type || '')) out.problems.push(`Video page served with wrong type "${v.type}": ${v.url}`); }
       else if (!/video\/mp4/.test(v.type || '')) out.problems.push(`Video served with wrong type "${v.type}": ${v.url}`);
       else if (/_MMS\.mp4$/.test(v.url) && v.sizeKB > 600) out.problems.push(`Text-message video is ${v.sizeKB} KB (keep under 600 KB): ${v.url}`);
     });
@@ -449,7 +462,7 @@ app.post('/voice/install/confirm', (req, res) => {
       `Hi ${name}! Thank you for contacting UHS regarding your installation or home assessment request. ` +
       `One of our comfort advisors will call you back within the next hour to schedule your free assessment. ` +
       `We appreciate your patience! - UHS Team` +
-      (VIDEOS ? `\n\nMeet your comfort advisor (HD video): ${VIDEOS.assessment.hd}` : '');
+      (VIDEOS ? `\n\nMeet your comfort advisor: ${VIDEOS.assessment.page}` : '');
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.assessment, 'Installation/assessment confirmation');
 
@@ -756,7 +769,7 @@ app.post('/voice/repair/confirm', (req, res) => {
       `Hi ${name}! Thank you for contacting UHS about your repair. ` +
       `Our technician will call you back within the next hour. ` +
       `We look forward to serving you. - UHS Team` +
-      (VIDEOS ? `\n\nMeet your technician (HD video): ${VIDEOS.repair.hd}` : '');
+      (VIDEOS ? `\n\nMeet your technician: ${VIDEOS.repair.page}` : '');
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.repair, 'Repair confirmation');
 
