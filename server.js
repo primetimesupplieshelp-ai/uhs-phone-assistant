@@ -21,6 +21,42 @@ const client            = twilio(TWILIO_SID, TWILIO_AUTH_TOKEN);
 // useful elsewhere (e.g. a website chatbot or follow-up email).
 const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; // ← Set in Railway env vars
 
+// ── WELCOME VIDEOS (sent with the customer's confirmation text) ──
+// Upload the 4 video files to your Netlify site in a folder called "videos", then set
+// MEDIA_BASE_URL in Railway to your site address, e.g. https://your-site.netlify.app
+//   *_MMS.mp4  → small (~580 KB) copy that plays right inside the text message
+//   *_v4.mp4   → full-HD copy, linked in the text for a sharper view
+// Leave MEDIA_BASE_URL unset to send plain texts with no video.
+const MEDIA_BASE_URL = (process.env.MEDIA_BASE_URL || '').replace(/\/+$/, '');
+const VIDEOS = MEDIA_BASE_URL ? {
+  repair: {
+    mms: `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_MMS.mp4`,
+    hd:  `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_v4.mp4`,
+  },
+  assessment: {
+    mms: `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_MMS.mp4`,
+    hd:  `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_v4.mp4`,
+  },
+} : null;
+
+// Sends the customer's confirmation text with the welcome video attached (MMS).
+// If Twilio rejects the video (number not MMS-capable, link unreachable, etc.) it
+// automatically re-sends the same text without the video, so the customer always
+// gets their confirmation. The HD link in the text is the backup if a carrier drops the video.
+function sendCustomerText(to, body, video, label) {
+  const base = { body, from: TWILIO_FROM, to };
+  const withVideo = video ? Object.assign({}, base, { mediaUrl: [video.mms] }) : base;
+  return client.messages.create(withVideo).then(() => {
+    console.log(`✅ ${label} text${video ? ' + video' : ''} sent to ${to}`);
+  }).catch(err => {
+    if (!video) { console.error(`❌ Failed to send ${label} text:`, err.message); return; }
+    console.warn(`⚠️ ${label} video could not be attached (${err.message}); sending text only`);
+    return client.messages.create(base).then(() => {
+      console.log(`✅ ${label} text (no video) sent to ${to}`);
+    }).catch(e2 => console.error(`❌ Failed to send ${label} text:`, e2.message));
+  });
+}
+
 // ── IN-MEMORY SESSION STORES ──
 const repairSessions  = {};
 const installSessions = {};
@@ -307,21 +343,14 @@ app.post('/voice/install/confirm', (req, res) => {
       console.error(`❌ Failed to send install lead SMS to team:`, err.message);
     });
 
-    // Confirm to customer via SMS (no quote-form link — callback only)
+    // Confirm to customer via text + welcome video
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS regarding your installation or home assessment request. ` +
       `One of our comfort advisors will call you back within the next hour to schedule your free assessment. ` +
-      `We appreciate your patience! – UHS Team`;
+      `We appreciate your patience! – UHS Team` +
+      (VIDEOS ? `\n\nMeet your comfort advisor (HD video): ${VIDEOS.assessment.hd}` : '');
 
-    client.messages.create({
-      body: customerMessage,
-      from: TWILIO_FROM,
-      to:   phone,
-    }).then(() => {
-      console.log(`✅ Installation/assessment confirmation SMS sent to ${phone}`);
-    }).catch(err => {
-      console.error(`❌ Failed to send install confirm SMS:`, err.message);
-    });
+    sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.assessment, 'Installation/assessment confirmation');
 
     // Clean up session
     delete installSessions[callerPhone];
@@ -329,7 +358,8 @@ app.post('/voice/install/confirm', (req, res) => {
     sayTo(twiml, `Perfect — your request has been submitted. ` +
         `One of our comfort advisors will call you back within the next hour ` +
         `to schedule your free home assessment. ` +
-        `We have also sent a confirmation text message to this number. ` +
+        `We have also sent a confirmation text message to this number` +
+        (VIDEOS ? `, with a short video so you know who to expect. ` : `. `) +
         `Thank you so much for calling UHS. Have a wonderful day!`);
 
     twiml.hangup();
@@ -620,27 +650,21 @@ app.post('/voice/repair/confirm', (req, res) => {
       console.error(`❌ Failed to send repair SMS to team:`, err.message);
     });
 
-    // Confirm to customer via SMS
+    // Confirm to customer via text + welcome video
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS about your repair. ` +
       `Our technician will call you back within the next hour. ` +
-      `Your repair is a flat ${REPAIR_FLAT_FEE} fee as long as no additional parts are required. – UHS Team`;
+      `We look forward to serving you. – UHS Team` +
+      (VIDEOS ? `\n\nMeet your technician (HD video): ${VIDEOS.repair.hd}` : '');
 
-    client.messages.create({
-      body: customerMessage,
-      from: TWILIO_FROM,
-      to:   phone,
-    }).then(() => {
-      console.log(`✅ Repair confirmation SMS sent to ${phone}`);
-    }).catch(err => {
-      console.error(`❌ Failed to send repair confirm SMS:`, err.message);
-    });
+    sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.repair, 'Repair confirmation');
 
     delete repairSessions[callerPhone];
 
     sayTo(twiml,
       `Perfect, your repair request has been submitted. ` +
-      `Our technician will call you back within the next hour, and we have sent you a confirmation text. ` +
+      `Our technician will call you back within the next hour, and we have sent you a confirmation text` +
+      (VIDEOS ? ` with a short video so you know who is coming. ` : `. `) +
       `Thank you for calling UHS. Have a great day!`
     );
     twiml.hangup();
