@@ -68,7 +68,7 @@ const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; //
 // Leave MEDIA_BASE_URL unset to send plain texts with no video.
 //
 // VIDEO_MODE (optional Railway variable):
-//   link (default) → normal text with a link to the full-quality video page. Most phones show
+//   link (default) → a second text with just the link to the full-quality video page. Most phones show
 //                    a preview picture. Best quality, cheapest, and the most reliable delivery.
 //   mms            → also attaches the small video file to the text (carriers shrink it, so it looks
 //                    blurry, and some carriers refuse video texts).
@@ -87,23 +87,40 @@ const VIDEOS = MEDIA_BASE_URL ? {
   },
 } : null;
 
-// Sends the customer's confirmation text with the welcome video attached (MMS).
-// If Twilio rejects the video (number not MMS-capable, link unreachable, etc.) it
-// automatically re-sends the same text without the video, so the customer always
-// gets their confirmation. The HD link in the text is the backup if a carrier drops the video.
-function sendCustomerText(to, body, video, label) {
-  if (VIDEO_MODE !== 'mms') video = null;   // link mode: the video link is already in the body
-  const base = { body, from: TWILIO_FROM, to };
-  const withVideo = video ? Object.assign({}, base, { mediaUrl: [video.mms] }) : base;
-  return sendMsg(withVideo).then(() => {
-    console.log(`✅ ${label} text${video ? ' + video' : ''} sent to ${to}`);
-  }).catch(err => {
-    if (!video) { console.error(`❌ Failed to send ${label} text:`, err.message); return; }
-    console.warn(`⚠️ ${label} video could not be attached (${err.message}); sending text only`);
-    return sendMsg(base).then(() => {
-      console.log(`✅ ${label} text (no video) sent to ${to}`);
-    }).catch(e2 => console.error(`❌ Failed to send ${label} text:`, e2.message));
-  });
+// Sends the customer TWO texts:
+//   1) the welcome / thank-you message
+//   2) a few seconds later, a separate text with ONLY the video link, so the phone shows
+//      it as a preview card (picture + title) the customer can tap to play the video.
+// The link goes in its own text because phones only show the preview card when the link
+// is the whole message. If VIDEO_MODE=mms, the small video file is also attached to the
+// second text; if Twilio rejects the file, the link is sent on its own instead.
+const LINK_DELAY_MS = 3000;   // gap between the two texts so they arrive in the right order
+const wait = ms => new Promise(r => setTimeout(r, ms));
+async function sendCustomerText(to, body, video, label) {
+  try {
+    await sendMsg({ body, from: TWILIO_FROM, to });
+    console.log(`✅ ${label} text sent to ${to}`);
+  } catch (err) {
+    console.error(`❌ Failed to send ${label} text:`, err.message);
+  }
+  if (!video) return;
+  await wait(LINK_DELAY_MS);
+  const linkMsg = { body: video.page, from: TWILIO_FROM, to };
+  if (VIDEO_MODE === 'mms') {
+    try {
+      await sendMsg(Object.assign({}, linkMsg, { mediaUrl: [video.mms] }));
+      console.log(`✅ ${label} video link + video file sent to ${to}`);
+      return;
+    } catch (err) {
+      console.warn(`⚠️ ${label} video file could not be attached (${err.message}); sending link only`);
+    }
+  }
+  try {
+    await sendMsg(linkMsg);
+    console.log(`✅ ${label} video link sent to ${to}`);
+  } catch (err) {
+    console.error(`❌ Failed to send ${label} video link:`, err.message);
+  }
 }
 
 // ── SELF-CHECK ──
@@ -461,8 +478,7 @@ app.post('/voice/install/confirm', (req, res) => {
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS regarding your installation or home assessment request. ` +
       `One of our comfort advisors will call you back within the next hour to schedule your free assessment. ` +
-      `We appreciate your patience! - UHS Team` +
-      (VIDEOS ? `\n\nMeet your comfort advisor: ${VIDEOS.assessment.page}` : '');
+      `We appreciate your patience! - UHS Team`;
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.assessment, 'Installation/assessment confirmation');
 
@@ -768,8 +784,7 @@ app.post('/voice/repair/confirm', (req, res) => {
     const customerMessage =
       `Hi ${name}! Thank you for contacting UHS about your repair. ` +
       `Our technician will call you back within the next hour. ` +
-      `We look forward to serving you. - UHS Team` +
-      (VIDEOS ? `\n\nMeet your technician: ${VIDEOS.repair.page}` : '');
+      `We look forward to serving you. - UHS Team`;
 
     sendCustomerText(phone, customerMessage, VIDEOS && VIDEOS.repair, 'Repair confirmation');
 
