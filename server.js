@@ -42,6 +42,7 @@ app.post('/sms-status', (req, res) => {
     const icon = MessageStatus === 'delivered' ? '📬' : MessageStatus === 'sent' ? '📤' : '🚫';
     console.log(`${icon} ${MessageSid} → ${To}: ${MessageStatus}` +
       (ErrorCode ? ` (error ${ErrorCode}${SMS_ERRORS[ErrorCode] ? ': ' + SMS_ERRORS[ErrorCode] : ''})` : ''));
+    onVideoStatus(MessageSid, MessageStatus, ErrorCode);
   }
   res.sendStatus(204);
 });
@@ -51,6 +52,7 @@ app.post('/sms-status', (req, res) => {
 const TWILIO_SID        = process.env.TWILIO_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM       = process.env.TWILIO_FROM;       // Your Twilio phone number  e.g. +18127922721
+const SMS_FROM          = process.env.TWILIO_SMS_FROM || TWILIO_FROM;   // number texts are sent from (see WELCOME VIDEOS below)
 const TEAM_NOTIFY_TO    = '+16473857954';    // Number to receive repair alerts (Mohammad's number)
 const client            = twilio(TWILIO_SID, TWILIO_AUTH_TOKEN);
 
@@ -61,73 +63,90 @@ const client            = twilio(TWILIO_SID, TWILIO_AUTH_TOKEN);
 const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; // ← Set in Railway env vars
 
 // ── WELCOME VIDEOS (sent with the customer's confirmation text) ──
-// Upload the 4 video files to your Netlify site in a folder called "videos", then set
-// MEDIA_BASE_URL in Railway to your site address, e.g. https://your-site.netlify.app
-//   /repair and /assessment → watch pages that play the full-quality video (sent as a link)
-//   *_MMS.mp4  → small (~580 KB) copy, only used when VIDEO_MODE=mms
-// Leave MEDIA_BASE_URL unset to send plain texts with no video.
+// Upload the video files to your Netlify site (folder "videos"), then set MEDIA_BASE_URL in Railway
+// to your site address, e.g. https://uhs-media.netlify.app. Leave it unset to send plain texts with no video.
 //
 // VIDEO_MODE (optional Railway variable):
-//   link (default) → a second text with just the link to the full-quality video page. Most phones show
-//                    a preview picture. Best quality, cheapest, and the most reliable delivery.
-//   mms            → also attaches the small video file to the text (carriers shrink it, so it looks
-//                    blurry, and some carriers refuse video texts).
+//   mms (default)  → the video itself is sent in the text (plays right in the conversation, no link to tap).
+//                    If Twilio refuses the video, or the customer's carrier can't deliver it, a text with
+//                    the video link is sent automatically instead, so nobody is left without the video.
+//   link           → a text with only the link to the full-quality video page.
+//
+// TWILIO_SMS_FROM (optional Railway variable): the number the texts come FROM. Use a Canadian
+// (e.g. 647/416) MMS-capable Twilio number here: texts from a US number to Canadian phones are blocked
+// unless that US number is registered for A2P 10DLC. Calls keep using TWILIO_FROM.
 const MEDIA_BASE_URL = (process.env.MEDIA_BASE_URL || '').replace(/\/+$/, '');
-const VIDEO_MODE = (process.env.VIDEO_MODE || 'link').toLowerCase() === 'mms' ? 'mms' : 'link';
+const VIDEO_MODE = (process.env.VIDEO_MODE || 'mms').toLowerCase() === 'link' ? 'link' : 'mms';
 const VIDEOS = MEDIA_BASE_URL ? {
   repair: {
     mms: `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_v4.mp4`,
     page: `${MEDIA_BASE_URL}/repair/`,
+    caption: 'Meet your UHS technician! Here is a short video so you know who is coming to your door. - UHS Team',
   },
   assessment: {
     mms: `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_v4.mp4`,
     page: `${MEDIA_BASE_URL}/assessment/`,
+    caption: 'Meet your UHS comfort advisor! Here is a short video so you know who to expect. - UHS Team',
   },
 } : null;
 
 // Sends the customer TWO texts:
 //   1) the welcome / thank-you message
-//   2) a few seconds later, a separate text with ONLY the video link, so the phone shows
-//      it as a preview card (picture + title) the customer can tap to play the video.
-// The link goes in its own text because phones only show the preview card when the link
-// is the whole message. If VIDEO_MODE=mms, the small video file is also attached to the
-// second text; if Twilio rejects the file, the link is sent on its own instead.
+//   2) a few seconds later, the welcome video itself (MMS) with a one-line caption and NO link.
+// Automatic backup: if Twilio rejects the video straight away, or reports later that the customer's
+// phone/carrier could not receive it (status "undelivered"/"failed"), the customer gets a text with
+// the video link instead. That backup is sent once per customer.
 const LINK_DELAY_MS = 3000;   // gap between the two texts so they arrive in the right order
 const wait = ms => new Promise(r => setTimeout(r, ms));
+const videoBackup = new Map();   // MMS message SID → {to, page, label, at}
+function linkBackupText(video){ return `Sorry, our welcome video couldn't be delivered to your phone. You can watch it here: ${video.page} - UHS Team`; }
+async function sendVideoLink(to, video, label, why){
+  try {
+    await sendMsg({ body: why ? linkBackupText(video) : video.page, from: SMS_FROM, to });
+    console.log(`✅ ${label} video link sent to ${to}${why ? ' (backup: ' + why + ')' : ''}`);
+  } catch (err) {
+    console.error(`❌ Failed to send ${label} video link:`, err.message);
+  }
+}
 async function sendCustomerText(to, body, video, label) {
   try {
-    await sendMsg({ body, from: TWILIO_FROM, to });
+    await sendMsg({ body, from: SMS_FROM, to });
     console.log(`✅ ${label} text sent to ${to}`);
   } catch (err) {
     console.error(`❌ Failed to send ${label} text:`, err.message);
   }
   if (!video) return;
   await wait(LINK_DELAY_MS);
-  const linkMsg = { body: video.page, from: TWILIO_FROM, to };
-  if (VIDEO_MODE === 'mms') {
-    try {
-      await sendMsg(Object.assign({}, linkMsg, { mediaUrl: [video.mms] }));
-      console.log(`✅ ${label} video link + video file sent to ${to}`);
-      return;
-    } catch (err) {
-      console.warn(`⚠️ ${label} video file could not be attached (${err.message}); sending link only`);
-    }
-  }
+  if (VIDEO_MODE === 'link') return sendVideoLink(to, video, label);
   try {
-    await sendMsg(linkMsg);
-    console.log(`✅ ${label} video link sent to ${to}`);
+    const m = await sendMsg({ body: video.caption, mediaUrl: [video.mms], from: SMS_FROM, to });
+    videoBackup.set(m.sid, { to, video, label, at: Date.now() });
+    console.log(`✅ ${label} video sent to ${to} (waiting for delivery report)`);
   } catch (err) {
-    console.error(`❌ Failed to send ${label} video link:`, err.message);
+    console.warn(`⚠️ ${label} video was refused by Twilio (${err.message})`);
+    await sendVideoLink(to, video, label, 'video refused');
   }
 }
+// Called from /sms-status: if a video text could not be delivered, send the link instead.
+function onVideoStatus(sid, status, errorCode){
+  const b = videoBackup.get(sid); if (!b) return;
+  if (status === 'delivered') { videoBackup.delete(sid); console.log(`🎥 ${b.label} video delivered to ${b.to}`); return; }
+  if (status === 'undelivered' || status === 'failed') {
+    videoBackup.delete(sid);
+    sendVideoLink(b.to, b.video, b.label, `video ${status}${errorCode ? ', error ' + errorCode : ''}`);
+  }
+}
+setInterval(() => { const old = Date.now() - 6 * 3600 * 1000; for (const [k, v] of videoBackup) if (v.at < old) videoBackup.delete(k); }, 3600 * 1000).unref();
 
 // ── SELF-CHECK ──
 // Runs when the server starts, and any time you open  https://<your-railway-address>/diagnostics
 // in a browser. It asks Twilio directly why texts are or aren't arriving, and checks the video links.
 // Phone numbers are masked (last 4 digits only).
 const https = require('https');
+const CA_AREA = '204 226 236 249 250 257 263 289 306 343 354 365 367 368 382 387 403 416 418 428 431 437 438 450 460 468 474 506 514 519 548 579 581 584 587 604 613 639 647 672 683 705 709 742 753 778 780 782 807 819 825 867 873 879 902 905 942'.split(' ');
+const isCanadian = n => CA_AREA.includes(String(n || '').replace(/\D/g, '').replace(/^1/, '').slice(0, 3));
 const mask = n => (n ? '***' + String(n).replace(/\D/g, '').slice(-4) : n);
 function headCheck(url) {
   return new Promise(resolve => {
@@ -142,7 +161,7 @@ function headCheck(url) {
   });
 }
 async function runDiagnostics() {
-  const out = { videoMode: VIDEO_MODE, problems: [] };
+  const out = { videoMode: VIDEO_MODE, textsFrom: SMS_FROM, problems: [] };
   try {
     const acct = await client.api.v2010.accounts(TWILIO_SID).fetch();
     out.account = { type: acct.type, status: acct.status };
@@ -150,17 +169,19 @@ async function runDiagnostics() {
     if (acct.status !== 'active') out.problems.push(`Twilio account status is "${acct.status}" (must be active).`);
   } catch (e) { out.account = { error: e.message }; out.problems.push('Could not read the Twilio account. Check TWILIO_SID and TWILIO_AUTH_TOKEN in Railway.'); }
   try {
-    const nums = await client.incomingPhoneNumbers.list({ phoneNumber: TWILIO_FROM, limit: 1 });
-    if (!nums.length) out.problems.push(`TWILIO_FROM (${TWILIO_FROM}) is not a number on this Twilio account.`);
+    const nums = await client.incomingPhoneNumbers.list({ phoneNumber: SMS_FROM, limit: 1 });
+    if (!nums.length) out.problems.push(`The texting number (${SMS_FROM}) is not a number on this Twilio account. Check TWILIO_SMS_FROM / TWILIO_FROM.`);
     else {
       const n = nums[0];
       out.fromNumber = { number: n.phoneNumber, sms: n.capabilities.sms, mms: n.capabilities.mms, country: n.phoneNumber.startsWith('+1') ? 'US/Canada' : 'other' };
       if (!n.capabilities.sms) out.problems.push('Your Twilio number cannot send SMS.');
-      if (!n.capabilities.mms && VIDEO_MODE === 'mms') out.problems.push('Your Twilio number cannot send MMS (videos). Texts will go out without the video.');
+      if (!n.capabilities.mms && VIDEO_MODE === 'mms') out.problems.push('Your texting number cannot send MMS (videos). Customers will get the video link instead.');
+      out.fromNumber.canadian = isCanadian(n.phoneNumber);
+      if (!out.fromNumber.canadian) out.problems.push(`Texts come from a US number (${n.phoneNumber}). Canadian carriers block texts and videos from US numbers that are not registered for A2P 10DLC (error 30034). Easiest fix: buy a Canadian MMS number in Twilio and set it as TWILIO_SMS_FROM in Railway.`);
     }
   } catch (e) { out.fromNumber = { error: e.message }; }
   try {
-    const msgs = await client.messages.list({ from: TWILIO_FROM, limit: 6 });
+    const msgs = await client.messages.list({ from: SMS_FROM, limit: 6 });
     out.recentTexts = msgs.map(m => ({
       sent: m.dateCreated, to: mask(m.to), status: m.status, video: +m.numMedia > 0,
       error: m.errorCode ? `${m.errorCode}: ${SMS_ERRORS[m.errorCode] || m.errorMessage || 'see twilio.com/docs/api/errors/' + m.errorCode}` : null,
@@ -466,7 +487,7 @@ app.post('/voice/install/confirm', (req, res) => {
 
     sendMsg({
       body: teamMessage,
-      from: TWILIO_FROM,
+      from: SMS_FROM,
       to:   TEAM_NOTIFY_TO || TWILIO_FROM, // Falls back to Twilio number if TEAM_NOTIFY_TO not set
     }).then(() => {
       console.log(`✅ Installation/assessment lead SMS sent to UHS team`);
@@ -772,7 +793,7 @@ app.post('/voice/repair/confirm', (req, res) => {
 
     sendMsg({
       body: teamMessage,
-      from: TWILIO_FROM,
+      from: SMS_FROM,
       to:   TEAM_NOTIFY_TO || TWILIO_FROM,
     }).then(() => {
       console.log(`✅ Repair request SMS sent to UHS team`);
@@ -820,6 +841,69 @@ app.post('/voice/repair/confirm-retry', (req, res) => {
   readBackRepair(twiml, session, `We did not receive your selection. `);
   sayTo(twiml, `We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`);
   sendXml(res, twiml);
+});
+
+// ── REPORT BUILDER: VOICE NOTE → CUSTOMER BULLET POINTS ──
+// The report builder's "✨ Turn into customer bullet points" button posts the technician's voice note here.
+// Railway variables:  ANTHROPIC_API_KEY  (from console.anthropic.com)
+//                     SUMMARY_KEY        (any password you choose; paste the same one into the builder's settings)
+// Optional:           SUMMARY_MODEL      (default claude-haiku-5-5)
+const SUMMARY_PROMPT = `You turn an HVAC technician's spoken notes into short, plain-language bullet points for a homeowner's repair quote in Ontario, Canada.
+Rules:
+- Use only facts from the notes. Never invent readings, parts, prices or problems.
+- Plain words a homeowner understands. Keep numbers and units (µF, °F, ppm, in. w.c., amps). Max 18 words per bullet.
+- "found": what the technician saw or measured. "why": why it matters to the homeowner (comfort, safety, cost, equipment life). "fix": the recommended repair.
+- 1 to 3 bullets each; use an empty list if the notes say nothing for that part.
+- "title": 3 to 7 words naming the problem, e.g. "Weak outdoor fan capacitor".
+- "level": "red" for safety risks (gas, carbon monoxide, electrical, flooding) or no heat/no cooling, "orange" for repairs that should not wait, "green" for routine or minor items.
+Reply with JSON only: {"title":"","level":"","found":[],"why":[],"fix":[]}`;
+function askClaude(transcript) {
+  const body = JSON.stringify({
+    model: process.env.SUMMARY_MODEL || 'claude-haiku-5-5',
+    max_tokens: 600,
+    system: SUMMARY_PROMPT,
+    messages: [{ role: 'user', content: 'Technician notes:\n' + transcript }],
+  });
+  return new Promise((resolve, reject) => {
+    const r = https.request('https://api.anthropic.com/v1/messages', {
+      method: 'POST', timeout: 20000,
+      headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-length': Buffer.byteLength(body) },
+    }, res => {
+      let data = '';
+      res.on('data', c => (data += c));
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (res.statusCode !== 200) return reject(new Error((j.error && j.error.message) || 'HTTP ' + res.statusCode));
+          const text = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+          const m = text.match(/\{[\s\S]*\}/);
+          if (!m) return reject(new Error('no JSON in reply'));
+          resolve(JSON.parse(m[0]));
+        } catch (e) { reject(e); }
+      });
+    });
+    r.on('timeout', () => r.destroy(new Error('timed out')));
+    r.on('error', reject);
+    r.end(body);
+  });
+}
+const cleanList = (a) => (Array.isArray(a) ? a : []).map(x => String(x).trim()).filter(Boolean).slice(0, 4);
+app.post('/api/summarize', async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY is not set in Railway' });
+  if (!process.env.SUMMARY_KEY || req.get('x-uhs-key') !== process.env.SUMMARY_KEY) return res.status(401).json({ error: 'wrong access key' });
+  const transcript = String((req.body && req.body.transcript) || '').trim().slice(0, 4000);
+  if (!transcript) return res.status(400).json({ error: 'empty voice note' });
+  try {
+    const d = await askClaude(transcript);
+    res.json({
+      title: String(d.title || '').slice(0, 90),
+      level: ['green', 'orange', 'red'].includes(d.level) ? d.level : '',
+      found: cleanList(d.found), why: cleanList(d.why), fix: cleanList(d.fix),
+    });
+  } catch (e) {
+    console.error('❌ Summary failed:', e.message);
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // ── START SERVER ──
