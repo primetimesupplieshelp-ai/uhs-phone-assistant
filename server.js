@@ -77,15 +77,22 @@ const QUOTE_LINK = process.env.QUOTE_LINK || 'https://your-site.netlify.app'; //
 // unless that US number is registered for A2P 10DLC. Calls keep using TWILIO_FROM.
 const MEDIA_BASE_URL = (process.env.MEDIA_BASE_URL || '').replace(/\/+$/, '');
 const VIDEO_MODE = (process.env.VIDEO_MODE || 'mms').toLowerCase() === 'link' ? 'link' : 'mms';
+// Which video goes with which phone-menu option:
+//   Option 1 (Installation / Home Assessment) → assessment video
+//   Option 2 (Repair)                         → repair video
+// To swap in a different VSL later without editing this file, set REPAIR_VIDEO_URL or
+// ASSESSMENT_VIDEO_URL in Railway to the new MP4 link (keep it under 600 KB so it plays inside the text).
 const VIDEOS = MEDIA_BASE_URL ? {
   repair: {
-    mms: `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_MMS.mp4`,
+    name: 'Repair VSL',
+    mms: process.env.REPAIR_VIDEO_URL || `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Repair_VSL_v4.mp4`,
     page: `${MEDIA_BASE_URL}/repair/`,
     caption: 'Meet your UHS technician! Here is a short video so you know who is coming to your door. - UHS Team',
   },
   assessment: {
-    mms: `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_MMS.mp4`,
+    name: 'Home Assessment VSL',
+    mms: process.env.ASSESSMENT_VIDEO_URL || `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_MMS.mp4`,
     hd:  `${MEDIA_BASE_URL}/videos/UHS_Home_Assessment_VSL_v4.mp4`,
     page: `${MEDIA_BASE_URL}/assessment/`,
     caption: 'Meet your UHS comfort advisor! Here is a short video so you know who to expect. - UHS Team',
@@ -123,7 +130,7 @@ async function sendCustomerText(to, body, video, label) {
   try {
     const m = await sendMsg({ body: video.caption, mediaUrl: [video.mms], from: SMS_FROM, to });
     videoBackup.set(m.sid, { to, video, label, at: Date.now() });
-    console.log(`✅ ${label} video sent to ${to} (waiting for delivery report)`);
+    console.log(`✅ ${label}: ${video.name} (${video.mms.split('/').pop()}) sent to ${to} (waiting for delivery report)`);
   } catch (err) {
     console.warn(`⚠️ ${label} video was refused by Twilio (${err.message})`);
     await sendVideoLink(to, video, label, 'video refused');
