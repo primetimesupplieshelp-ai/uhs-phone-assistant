@@ -168,7 +168,7 @@ function headCheck(url) {
   });
 }
 async function runDiagnostics() {
-  const out = { videoMode: VIDEO_MODE, textsFrom: SMS_FROM, problems: [] };
+  const out = { voice: VOICE, transferTo: mask(TRANSFER_TO), videoMode: VIDEO_MODE, textsFrom: SMS_FROM, problems: [] };
   try {
     const acct = await client.api.v2010.accounts(TWILIO_SID).fetch();
     out.account = { type: acct.type, status: acct.status };
@@ -220,14 +220,34 @@ app.get('/diagnostics', async (req, res) => {
 const repairSessions  = {};
 const installSessions = {};
 
-// ── VOICE HELPER: Polly Joanna at ~10% slower rate ──
-// The Twilio library escapes any text passed to say(), so a hand-written "<speak><prosody>" string was
-// sent as plain text (the slow-down never applied). sayTo() builds real SSML with the library instead.
+// ── VOICE HELPER ──
+// Default voice: Polly.Joanna-Generative — Twilio's newest, most human-sounding voice tier (natural pacing,
+// tone and pauses). It is the same "Joanna" customers heard before, but far less robotic.
+// To try a different voice without editing this file, set VOICE in Railway, e.g.:
+//   Polly.Joanna-Generative        (default — warm, professional female)
+//   Polly.Ruth-Generative          (friendly, conversational female)
+//   Polly.Matthew-Generative       (professional male)
+//   Google.en-US-Chirp3-HD-Aoede   (very natural female, Google)
+//   Google.en-US-Chirp3-HD-Charon  (very natural male, Google)
+//   Polly.Joanna-Neural            (cheaper fallback; good quality)
+// Generative voices pace themselves naturally and accept little/no SSML, so for them the text is sent
+// plain. Neural/Standard voices get SSML (slightly slower rate, digits read one by one).
 // Put [[digits:1234]] in the text to have a number read digit by digit.
+const VOICE = process.env.VOICE || 'Polly.Joanna-Generative';
+const VOICE_PLAIN = /Generative|Chirp/i.test(VOICE);
 function sayTo(node, text) {
-  const say = node.say({ voice: 'Polly.Joanna', language: 'en-US' });
-  const pros = say.prosody({ rate: '90%' });
-  String(text).split(/(\[\[digits:[^\]]*\]\])/).forEach(part => {
+  const parts = String(text).split(/(\[\[digits:[^\]]*\]\])/);
+  const say = node.say({ voice: VOICE, language: 'en-US' });
+  if (VOICE_PLAIN) {
+    // "6473857954" → "6, 4, 7, 3, ..." so it's read digit by digit with a short pause between each
+    say.addText(parts.map(part => {
+      const m = part.match(/^\[\[digits:([^\]]*)\]\]$/);
+      return m ? m[1].split('').join(', ') : part;
+    }).join(''));
+    return;
+  }
+  const pros = say.prosody({ rate: '95%' });
+  parts.forEach(part => {
     const m = part.match(/^\[\[digits:([^\]]*)\]\]$/);
     if (m) pros.sayAs({ 'interpret-as': 'digits' }, m[1]);
     else if (part) pros.addText(part);
@@ -248,10 +268,10 @@ app.post('/voice', (req, res) => {
   });
 
   sayTo(gather, `Thank you for calling UHS, your trusted home comfort provider. ` +
-      `For us to better assist you, please select from the following options. ` +
-      `Press 1 for all Installation or Home Assessment Requests. ` +
-      `Press 2 for all Repair Requests. ` +
-      `To repeat this menu, press 9.`);
+      `For installations or a free home assessment, press 1. ` +
+      `For repairs, press 2. ` +
+      `For all other inquiries, or to speak with a member of our team, press 3. ` +
+      `To hear these options again, press 9.`);
 
   // No input fallback
   sayTo(twiml, `We did not receive your selection. Please call back and try again. Thank you for calling UHS. Goodbye.`);
@@ -291,6 +311,11 @@ app.post('/voice/menu', (req, res) => {
     repairSessions[callerPhone] = { step: 'issue' };
     gatherRepairIssue(twiml, `No problem at all, we are here to help. What is the issue you are calling about today?`);
     twiml.redirect('/voice/repair/issue-retry');
+
+  } else if (digit === '3') {
+    // ── OPTION 3: Other inquiries — transfer to the next available team member ──
+    sayTo(twiml, `Of course. Please hold while we connect you with the next available member of our team.`);
+    twiml.redirect('/voice/transfer');
 
   } else if (digit === '9') {
     twiml.redirect('/voice');
@@ -572,13 +597,14 @@ app.post('/voice/install/confirm-retry', (req, res) => {
 
 // ────────────────────────────────────────────────────────────────
 // REPAIR FLOW (Option 2)
-//   Step 1  Issue    → "Sure… flat $90 repair fee…"
+//   Step 1  Issue    → "Sure… fast, affordable service… free diagnostic with your repair…"
 //   Step 2  Address  → "Great, that is within our service area…"
 //   Step 3  Name
 //   Step 4  Phone    → press 1 to use the number they are calling from, or key in another
 //   Step 5  Quick confirm → submit, text the team + customer, callback within the hour
 // ────────────────────────────────────────────────────────────────
-const REPAIR_FLAT_FEE = '$90';
+// What the caller hears about pricing (no fixed price is quoted any more).
+const REPAIR_PITCH = 'At UHS, we pride ourselves on fast, affordable service, and your diagnostic is completely free with any repair.';
 
 // Callers' words can't contain the [[digits:]] marker used by sayTo().
 function clean(s) {
@@ -629,8 +655,8 @@ app.post('/voice/repair/issue', (req, res) => {
     input: 'speech', action: '/voice/repair/address', method: 'POST', timeout: 10, speechTimeout: 'auto',
   });
   sayTo(gather,
-    `Sure. Our technicians are specialized in repairing exactly this type of issue. ` +
-    `We charge a flat ${REPAIR_FLAT_FEE} fee for your repair, as long as no additional parts are required. ` +
+    `Sure. Our technicians specialize in exactly this type of issue. ` +
+    `${REPAIR_PITCH} ` +
     `Please share your exact address, including your street number, street name and city, ` +
     `so we can check that our local technician is in your area.`
   );
@@ -794,7 +820,7 @@ app.post('/voice/repair/confirm', (req, res) => {
       (phone !== callerPhone ? `Called from: ${callerPhone}\n` : '') +
       `Address: ${address}\n` +
       `Issue:   ${issue}\n` +
-      `Quoted:  ${REPAIR_FLAT_FEE} flat repair fee (no additional parts)\n` +
+      `Told:    FREE diagnostic with repair (no price quoted)\n` +
       `--------------------------\n` +
       `Customer was promised a call back WITHIN 1 HOUR.`;
 
@@ -849,6 +875,125 @@ app.post('/voice/repair/confirm-retry', (req, res) => {
   sayTo(twiml, `We were unable to receive your confirmation. Please call us back. Thank you for calling UHS.`);
   sendXml(res, twiml);
 });
+
+// ────────────────────────────────────────────────────────────────
+// OPTION 3: OTHER INQUIRIES → LIVE TRANSFER TO THE TEAM
+//   1) Caller hears "please hold" and hears ringing while Twilio calls TRANSFER_TO.
+//   2) Whoever answers at TRANSFER_TO first hears a short private announcement:
+//      "UHS customer call from …, press 1 to accept." Only after pressing 1 is the caller connected.
+//      This stops your personal voicemail from "answering" the business call.
+//   3) No answer / not accepted within TRANSFER_RING_SECONDS → the caller can leave a voicemail,
+//      and the team gets a text with the caller's number (and a link to the voicemail if one was left).
+// Railway variables (optional):
+//   TRANSFER_TO            number to ring (default +16473857954)
+//   TRANSFER_RING_SECONDS  how long to ring before going to voicemail (default 25)
+// ────────────────────────────────────────────────────────────────
+const TRANSFER_TO = formatPhone(process.env.TRANSFER_TO || '+16473857954');
+const TRANSFER_RING_SECONDS = parseInt(process.env.TRANSFER_RING_SECONDS, 10) || 25;
+const acceptedTransfers = new Map();   // caller's CallSid → time the team member pressed 1
+const abs = path => (PUBLIC_BASE ? PUBLIC_BASE + path : path);
+const isE164 = n => /^\+\d{10,15}$/.test(String(n || ''));
+
+function textTeam(body, label) {
+  sendMsg({ body, from: SMS_FROM, to: TEAM_NOTIFY_TO || TWILIO_FROM })
+    .then(() => console.log(`✅ ${label} SMS sent to UHS team`))
+    .catch(err => console.error(`❌ Failed to send ${label} SMS to team:`, err.message));
+}
+
+app.post('/voice/transfer', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const from  = req.body.From;
+  const dial  = twiml.dial({
+    // Show the CUSTOMER's number on your phone (falls back to the Twilio number for blocked/private callers)
+    callerId:       isE164(from) ? from : TWILIO_FROM,
+    timeout:        TRANSFER_RING_SECONDS,
+    answerOnBridge: true,                         // caller hears ringing until someone accepts
+    action:         abs('/voice/transfer/done'),
+    method:         'POST',
+  });
+  dial.number({ url: abs('/voice/transfer/screen'), method: 'POST' }, TRANSFER_TO);
+  console.log(`📞 Transferring ${mask(from)} to the team (${mask(TRANSFER_TO)})`);
+  sendXml(res, twiml);
+});
+
+// Played ONLY to the team member who answers (the customer doesn't hear this)
+app.post('/voice/transfer/screen', (req, res) => {
+  const twiml  = new twilio.twiml.VoiceResponse();
+  const caller = req.body.From && lastFour(req.body.From) ? req.body.From : '';
+  const gather = twiml.gather({ numDigits: 1, action: abs('/voice/transfer/accept'), method: 'POST', timeout: 8 });
+  sayTo(gather,
+    `U H S customer call` +
+    (caller ? ` from ${digitsSsml(caller.replace(/^\+1/, ''))}` : '') +
+    `. Press 1 to accept.`);
+  twiml.hangup();   // no key pressed (e.g. voicemail picked up) → drop this leg, customer goes to voicemail
+  sendXml(res, twiml);
+});
+
+app.post('/voice/transfer/accept', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  if (req.body.Digits === '1') {
+    acceptedTransfers.set(req.body.ParentCallSid, Date.now());
+    sayTo(twiml, `Connecting you now.`);   // when this ends, the two calls are joined
+  } else {
+    twiml.hangup();
+  }
+  sendXml(res, twiml);
+});
+
+// Runs on the customer's call once the transfer ends (talked, no answer, busy, or declined)
+app.post('/voice/transfer/done', (req, res) => {
+  const twiml    = new twilio.twiml.VoiceResponse();
+  const callSid  = req.body.CallSid;
+  const from     = req.body.From;
+  const accepted = acceptedTransfers.has(callSid);
+  acceptedTransfers.delete(callSid);
+
+  if (accepted && req.body.DialCallStatus === 'completed') {
+    twiml.hangup();   // the call happened and has now ended
+    return sendXml(res, twiml);
+  }
+
+  console.log(`📵 Transfer not answered for ${mask(from)} (${req.body.DialCallStatus})`);
+  textTeam(
+    `MISSED CALL - UHS (other inquiries)\n` +
+    `--------------------------\n` +
+    `Caller: ${from || 'private number'}\n` +
+    `Nobody picked up the transfer. They are being offered voicemail now.\n` +
+    `--------------------------\n` +
+    `Please call them back as soon as possible.`,
+    'Missed transfer');
+
+  sayTo(twiml,
+    `We are sorry, all of our team members are currently helping other customers. ` +
+    `Please leave your name, phone number and a brief message after the tone, ` +
+    `and we will call you back as soon as possible.`);
+  twiml.record({
+    maxLength: 120, playBeep: true, finishOnKey: '#', trim: 'trim-silence',
+    action: abs('/voice/transfer/voicemail'), method: 'POST',
+  });
+  sayTo(twiml, `We did not receive a message. Thank you for calling UHS. Goodbye.`);
+  sendXml(res, twiml);
+});
+
+app.post('/voice/transfer/voicemail', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const secs  = parseInt(req.body.RecordingDuration, 10) || 0;
+  if (req.body.RecordingUrl && secs >= 2) {
+    textTeam(
+      `NEW VOICEMAIL - UHS (other inquiries)\n` +
+      `--------------------------\n` +
+      `Caller: ${req.body.From || 'private number'}\n` +
+      `Length: ${secs} seconds\n` +
+      `Listen: ${req.body.RecordingUrl}.mp3\n` +
+      `--------------------------`,
+      'Voicemail');
+  }
+  sayTo(twiml, `Thank you. Your message has been received, and a member of our team will call you back shortly. Have a great day!`);
+  twiml.hangup();
+  sendXml(res, twiml);
+});
+
+setInterval(() => { const old = Date.now() - 6 * 3600 * 1000; for (const [k, t] of acceptedTransfers) if (t < old) acceptedTransfers.delete(k); }, 3600 * 1000).unref();
 
 // ── REPORT BUILDER: VOICE NOTE → CUSTOMER BULLET POINTS ──
 // The report builder's "✨ Turn into customer bullet points" button posts the technician's voice note here.
