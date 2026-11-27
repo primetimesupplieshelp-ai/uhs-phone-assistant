@@ -260,6 +260,13 @@ function sayTo(node, text) {
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
+  // Blocked numbers are rejected before the menu even plays (they hear "number not in service")
+  if (isBlocked(req.body.From)) {
+    console.log(`⛔ Rejected blocked caller ${mask(req.body.From)}`);
+    twiml.reject({ reason: 'rejected' });
+    return sendXml(res, twiml);
+  }
+
   const gather = twiml.gather({
     numDigits: 1,
     action:    '/voice/menu',
@@ -314,8 +321,8 @@ app.post('/voice/menu', (req, res) => {
 
   } else if (digit === '3') {
     // ── OPTION 3: Other inquiries — transfer to the next available team member ──
-    sayTo(twiml, `Of course. Please hold while we connect you with the next available member of our team.`);
-    twiml.redirect('/voice/transfer');
+    // Goes through the spam check first (see SPAM PROTECTION below) — only real people reach your phone.
+    twiml.redirect('/voice/verify');
 
   } else if (digit === '9') {
     twiml.redirect('/voice');
@@ -877,6 +884,132 @@ app.post('/voice/repair/confirm-retry', (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────
+// SPAM PROTECTION (runs before every option-3 transfer)
+//   1) Human check: the caller must key in a random 2-digit code read out to them. Robocallers and
+//      auto-dialers can't, so they never ring your phone. 2 tries, then the call ends.
+//   2) Auto-block: a number that fails the check on 2 calls within 24 hours is blocked for 30 days
+//      (its calls are rejected before the menu plays).
+//   3) Private / hidden numbers can't be transferred; they're offered voicemail instead.
+//   4) Calls whose caller ID the phone network flags as faked (STIR/SHAKEN "failed") are hung up.
+//   5) Limit: one number can be transferred at most MAX_TRANSFERS_PER_DAY times per 24 hours;
+//      after that it goes to voicemail.
+// Railway variables (optional):
+//   BLOCKED_NUMBERS        numbers to block permanently, comma separated, e.g. +14165551234,+12895550000
+//   MAX_TRANSFERS_PER_DAY  default 3
+// Note: auto-blocks are kept in memory and clear when Railway redeploys/restarts. To block a number
+// for good, add it to BLOCKED_NUMBERS. Every block is printed in the logs with ⛔ / 🤖.
+// ────────────────────────────────────────────────────────────────
+const BLOCKED_NUMBERS = new Set((process.env.BLOCKED_NUMBERS || '').split(',').map(s => s.trim()).filter(Boolean).map(formatPhone));
+const MAX_TRANSFERS_PER_DAY = parseInt(process.env.MAX_TRANSFERS_PER_DAY, 10) || 3;
+const DAY_MS = 24 * 3600 * 1000;
+const autoBlocked      = new Map();   // number → blocked until (time)
+const failedChecks     = new Map();   // number → [times the human check was failed]
+const transferHistory  = new Map();   // number → [times a transfer was made]
+const pendingChecks    = new Map();   // CallSid → { code, tries }
+const verifiedCalls    = new Map();   // CallSid → time the caller passed the check
+
+function isBlocked(n) {
+  const f = formatPhone(n);
+  return BLOCKED_NUMBERS.has(f) || (autoBlocked.get(f) || 0) > Date.now();
+}
+const recent = (map, n) => (map.get(n) || []).filter(t => t > Date.now() - DAY_MS);
+const newCode = () => String(10 + Math.floor(Math.random() * 90));   // 10–99
+
+function addStrike(from) {
+  const f = formatPhone(from);
+  const list = recent(failedChecks, f).concat(Date.now());
+  failedChecks.set(f, list);
+  console.log(`🤖 ${mask(from)} failed the human check (${list.length} in 24h)`);
+  if (list.length >= 2) {
+    autoBlocked.set(f, Date.now() + 30 * DAY_MS);
+    console.log(`⛔ Auto-blocked ${mask(from)} for 30 days (failed the human check twice). Full number: ${f}`);
+  }
+}
+
+function offerVoicemail(twiml, intro) {
+  sayTo(twiml, intro +
+    ` Please leave your name, phone number and a brief message after the tone, ` +
+    `and we will call you back as soon as possible.`);
+  twiml.record({
+    maxLength: 120, playBeep: true, finishOnKey: '#', trim: 'trim-silence',
+    action: abs('/voice/transfer/voicemail'), method: 'POST',
+  });
+  sayTo(twiml, `We did not receive a message. Thank you for calling UHS. Goodbye.`);
+}
+
+function askForCode(twiml, prompt, code) {
+  const gather = twiml.gather({ input: 'dtmf', numDigits: 2, action: abs('/voice/verify/check'), method: 'POST', timeout: 8 });
+  sayTo(gather, `${prompt} ${digitsSsml(code)}.`);
+  twiml.redirect(abs('/voice/verify/check'));   // nothing entered → counts as a wrong try
+}
+
+app.post('/voice/verify', (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const from    = req.body.From;
+  const callSid = req.body.CallSid;
+  const verstat = String(req.body.StirVerstat || '');
+
+  if (/Failed/i.test(verstat)) {
+    console.log(`⛔ Hung up on ${mask(from)}: caller ID failed network verification (${verstat})`);
+    sayTo(twiml, `We are unable to connect this call. Goodbye.`);
+    twiml.hangup();
+    return sendXml(res, twiml);
+  }
+  if (!isE164(from)) {
+    offerVoicemail(twiml, `To protect our team from automated calls, we are unable to transfer calls from private or blocked numbers.`);
+    return sendXml(res, twiml);
+  }
+  if (recent(transferHistory, formatPhone(from)).length >= MAX_TRANSFERS_PER_DAY) {
+    console.log(`🚦 ${mask(from)} reached the daily transfer limit; sent to voicemail`);
+    offerVoicemail(twiml, `Our team is currently helping other customers.`);
+    return sendXml(res, twiml);
+  }
+
+  const code = newCode();
+  pendingChecks.set(callSid, { code, tries: 1 });
+  askForCode(twiml,
+    `Of course. Before we connect you, we just need to make sure this is not an automated call. ` +
+    `Please enter the following two digits on your keypad:`, code);
+  sendXml(res, twiml);
+});
+
+app.post('/voice/verify/check', (req, res) => {
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const from    = req.body.From;
+  const callSid = req.body.CallSid;
+  const check   = pendingChecks.get(callSid);
+
+  if (!check) { twiml.hangup(); return sendXml(res, twiml); }
+
+  if (String(req.body.Digits || '') === check.code) {
+    pendingChecks.delete(callSid);
+    verifiedCalls.set(callSid, Date.now());
+    const f = formatPhone(from);
+    transferHistory.set(f, recent(transferHistory, f).concat(Date.now()));
+    sayTo(twiml, `Thank you. Please hold while we connect you with the next available member of our team.`);
+    twiml.redirect(abs('/voice/transfer'));
+  } else if (check.tries < 2) {
+    check.tries++;
+    check.code = newCode();
+    askForCode(twiml, `Sorry, that did not match. Please enter these two digits:`, check.code);
+  } else {
+    pendingChecks.delete(callSid);
+    addStrike(from);
+    sayTo(twiml, `Sorry, we were unable to verify this call. Thank you for calling UHS. Goodbye.`);
+    twiml.hangup();
+  }
+  sendXml(res, twiml);
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, t] of autoBlocked) if (t < now) autoBlocked.delete(k);
+  for (const m of [failedChecks, transferHistory]) for (const [k] of m) { const r = recent(m, k); r.length ? m.set(k, r) : m.delete(k); }
+  for (const [k, v] of pendingChecks) if (!v.at) v.at = now; else if (v.at < now - 3600 * 1000) pendingChecks.delete(k);
+  for (const [k, t] of verifiedCalls) if (t < now - 6 * 3600 * 1000) verifiedCalls.delete(k);
+}, 3600 * 1000).unref();
+
+// ────────────────────────────────────────────────────────────────
 // OPTION 3: OTHER INQUIRIES → LIVE TRANSFER TO THE TEAM
 //   1) Caller hears "please hold" and hears ringing while Twilio calls TRANSFER_TO.
 //   2) Whoever answers at TRANSFER_TO first hears a short private announcement:
@@ -903,6 +1036,10 @@ function textTeam(body, label) {
 app.post('/voice/transfer', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const from  = req.body.From;
+  if (!verifiedCalls.has(req.body.CallSid)) {   // never transfer a call that skipped the spam check
+    twiml.redirect(abs('/voice/verify'));
+    return sendXml(res, twiml);
+  }
   const dial  = twiml.dial({
     // Show the CUSTOMER's number on your phone (falls back to the Twilio number for blocked/private callers)
     callerId:       isE164(from) ? from : TWILIO_FROM,
@@ -946,6 +1083,7 @@ app.post('/voice/transfer/done', (req, res) => {
   const callSid  = req.body.CallSid;
   const from     = req.body.From;
   const accepted = acceptedTransfers.has(callSid);
+  verifiedCalls.delete(callSid);
   acceptedTransfers.delete(callSid);
 
   if (accepted && req.body.DialCallStatus === 'completed') {
@@ -963,22 +1101,14 @@ app.post('/voice/transfer/done', (req, res) => {
     `Please call them back as soon as possible.`,
     'Missed transfer');
 
-  sayTo(twiml,
-    `We are sorry, all of our team members are currently helping other customers. ` +
-    `Please leave your name, phone number and a brief message after the tone, ` +
-    `and we will call you back as soon as possible.`);
-  twiml.record({
-    maxLength: 120, playBeep: true, finishOnKey: '#', trim: 'trim-silence',
-    action: abs('/voice/transfer/voicemail'), method: 'POST',
-  });
-  sayTo(twiml, `We did not receive a message. Thank you for calling UHS. Goodbye.`);
+  offerVoicemail(twiml, `We are sorry, all of our team members are currently helping other customers.`);
   sendXml(res, twiml);
 });
 
 app.post('/voice/transfer/voicemail', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const secs  = parseInt(req.body.RecordingDuration, 10) || 0;
-  if (req.body.RecordingUrl && secs >= 2) {
+  if (req.body.RecordingUrl && secs >= 3) {
     textTeam(
       `NEW VOICEMAIL - UHS (other inquiries)\n` +
       `--------------------------\n` +
